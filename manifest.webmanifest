@@ -1,19 +1,36 @@
 {
-  "name": "FantaCoach - Legarina",
+  "name": "FantaCoach",
   "short_name": "FantaCoach",
-  "description": "Assistente settimanale per la lega fantacalcio Legarina: news reali, calendario, alert e formazione consigliata.",
+  "description": "Assistente fantacalcio multi-utente: ogni persona gestisce le proprie squadre, news, calendario e formazione consigliata.",
   "id": "/",
   "start_url": "/?source=pwa",
   "scope": "/",
   "display": "standalone",
-  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+  "display_override": [
+    "window-controls-overlay",
+    "standalone",
+    "minimal-ui"
+  ],
   "background_color": "#07120c",
   "theme_color": "#07120c",
   "orientation": "portrait-primary",
   "lang": "it-IT",
-  "categories": ["sports", "utilities"],
+  "categories": [
+    "sports",
+    "utilities"
+  ],
   "icons": [
-    {"src":"/icons/icon-192.png","sizes":"192x192","type":"image/png","purpose":"any maskable"},
-    {"src":"/icons/icon-512.png","sizes":"512x512","type":"image/png","purpose":"any maskable"}
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
   ]
 }

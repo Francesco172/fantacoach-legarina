@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FantaCoach v0.6 - local/backend web service for Legarina.
+"""FantaCoach v0.8 - multi-user backend.
 
 Real inputs (when reachable from the user's connection):
 - Weekly player and probable-lineup articles: Google News RSS search.
@@ -29,6 +29,8 @@ from xml.etree import ElementTree as ET
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", os.environ.get("FANTACOACH_PORT", "8787")))
 ROOT = os.path.dirname(os.path.abspath(__file__))
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 CACHE_TTL_NEWS = 600
 CACHE_TTL_FIXTURES = 900
 REQUEST_TIMEOUT = 7
@@ -39,7 +41,7 @@ THESPORTSDB_KEY = os.environ.get("THESPORTSDB_KEY", "123")
 OFFICIAL_SCHEDULE_SOURCE = "https://www.legaseriea.it/serie-a/news/quando-si-gioca-anticipi-e-posticipi-fino-alla-12a-giornata"
 
 
-PLAYERS = [
+LEGACY_PLAYERS = [
     {"name": "Butez", "full": "Jean Butez", "club": "Como", "role": "POR"},
     {"name": "Martínez", "full": "Josep Martinez", "club": "Inter", "role": "POR"},
     {"name": "Stanković", "full": "Filip Stankovic", "club": "Venezia", "role": "POR"},
@@ -91,6 +93,86 @@ CLUB_ALIASES = {
     "Udinese": ["udinese", "udinese calcio"],
     "Sassuolo": ["sassuolo", "sassuolo calcio"],
 }
+
+
+SERIE_A_CLUBS = {"Atalanta","Bologna","Cagliari","Como","Fiorentina","Frosinone","Genoa","Inter","Juventus","Lazio","Lecce","Milan","Monza","Napoli","Parma","Roma","Sassuolo","Torino","Udinese","Venezia"}
+CLUB_ALIASES.update({
+    "Atalanta": ["atalanta", "atalanta bc"],
+    "Bologna": ["bologna", "bologna fc"],
+    "Cagliari": ["cagliari", "cagliari calcio"],
+    "Genoa": ["genoa", "genoa cfc"],
+    "Lecce": ["lecce", "us lecce"],
+    "Monza": ["monza", "ac monza"],
+    "Napoli": ["napoli", "ssc napoli"],
+    "Parma": ["parma", "parma calcio"],
+})
+
+def normalize_role(position):
+    pos = (position or "").lower()
+    if any(x in pos for x in ("goalkeeper", "keeper", "portiere")):
+        return "POR"
+    if any(x in pos for x in ("defender", "back", "difens")):
+        return "DIF"
+    if any(x in pos for x in ("forward", "striker", "winger", "attacc")):
+        return "ATT"
+    if any(x in pos for x in ("midfield", "centroc")):
+        return "CEN"
+    return "CEN"
+
+def normalize_player_input(raw):
+    if not isinstance(raw, dict):
+        return None
+    name = str(raw.get("name") or raw.get("full") or "").strip()
+    if not name:
+        return None
+    full = str(raw.get("full") or name).strip()
+    club = normalize_club(str(raw.get("club") or "").strip())
+    role = str(raw.get("role") or "CEN").upper().strip()
+    if role not in {"POR","DIF","CEN","ATT"}:
+        role = normalize_role(role)
+    return {"name": name, "full": full, "club": club, "role": role, "providerId": raw.get("providerId")}
+
+def search_players(query):
+    q = (query or "").strip()
+    if len(q) < 2:
+        return [], "locale"
+    qlow = q.lower()
+    results = []
+    seen = set()
+    for p in LEGACY_PLAYERS:
+        if qlow in p["name"].lower() or qlow in p["full"].lower():
+            item = {**p, "provider": "catalogo FantaCoach", "providerId": None, "roleEstimated": False}
+            results.append(item); seen.add((p["full"].lower(), p["club"]))
+    provider = "catalogo FantaCoach"
+    if len(q) >= 3:
+        try:
+            url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_KEY}/searchplayers.php?p={urllib.parse.quote(q)}"
+            data = fetch_json(url)
+            for raw in (data or {}).get("player") or []:
+                sport = (raw.get("strSport") or "").lower()
+                if sport and sport != "soccer":
+                    continue
+                club = normalize_club(raw.get("strTeam") or "")
+                if club not in SERIE_A_CLUBS:
+                    continue
+                full = (raw.get("strPlayer") or "").strip()
+                if not full:
+                    continue
+                key=(full.lower(),club)
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append({
+                    "name": full, "full": full, "club": club,
+                    "role": normalize_role(raw.get("strPosition")),
+                    "providerId": raw.get("idPlayer"),
+                    "provider": "TheSportsDB", "roleEstimated": True,
+                    "position": raw.get("strPosition") or ""
+                })
+            provider = "FantaCoach + TheSportsDB"
+        except Exception:
+            pass
+    return results[:12], provider
 
 SUSPENDED = ["squalificat", "squalifica", "espulso e squalific", "fermo per squalifica"]
 INJURED = ["lesione", "infortun", "operazione", "operato", "frattura", "indisponibile", "non convocat", "out per", "stop di"]
@@ -206,21 +288,22 @@ def fetch_player_news(player, days=7, limit=5):
         return player["name"], [], str(exc)
 
 
-def build_player_news(days=7, limit=5):
-    result = {p["name"]: [] for p in PLAYERS}
+def build_player_news(players, days=7, limit=5):
+    players = players or LEGACY_PLAYERS
+    result = {p["name"]: [] for p in players}
     errors = {}
 
     # Probe one player first. If DNS/network is unavailable, avoid launching 25 doomed requests.
-    first = PLAYERS[0]
+    first = players[0]
     name, articles, err = fetch_player_news(first, days, limit)
     result[name] = articles
     if err:
         network_markers = ("name resolution", "temporary failure", "nodename nor servname", "network is unreachable")
         if any(marker in err.lower() for marker in network_markers):
-            return result, {p["name"]: err for p in PLAYERS}
+            return result, {p["name"]: err for p in players}
         errors[name] = err
 
-    remaining = PLAYERS[1:]
+    remaining = players[1:]
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(fetch_player_news, p, days, limit): p for p in remaining}
         for future in as_completed(futures):
@@ -547,7 +630,8 @@ def derive_player_state(player, articles, fixture):
     aggregate_impact = max(-12, min(8, aggregate_impact))
 
     # An index, not a bookmaker-style probability. It is intentionally labelled as such in UI.
-    score_component = (BASE_SCORE.get(player["name"], 70) - 70) * 0.6
+    base_score = int(player.get("baseScore") or BASE_SCORE.get(player["name"], 70))
+    score_component = (base_score - 70) * 0.6
     lineup_index = 70 + score_component + lineup_adjust
     relevant_count = sum(1 for a in articles if int(a.get("impact") or 0) != 0)
     if relevant_count >= 2:
@@ -562,7 +646,7 @@ def derive_player_state(player, articles, fixture):
     if fixture:
         fixture_adjust = 1 if fixture.get("isHome") else 0
 
-    score = BASE_SCORE.get(player["name"], 70) + aggregate_impact + availability_adjust + fixture_adjust
+    score = base_score + aggregate_impact + availability_adjust + fixture_adjust
     score = int(max(20, min(99, score)))
 
     return {
@@ -574,7 +658,7 @@ def derive_player_state(player, articles, fixture):
         "availabilityImpact": availability_adjust,
         "fixtureImpact": fixture_adjust,
         "score": score,
-        "baseScore": BASE_SCORE.get(player["name"], 70),
+        "baseScore": base_score,
         "evidence": evidence,
     }
 
@@ -595,22 +679,26 @@ def fetch_lineup_news(club, opponent, days=4, limit=3):
         return [], str(exc)
 
 
-def build_dashboard(days=7, news_limit=5, fixture_days=21):
+def build_dashboard(players=None, days=7, news_limit=5, fixture_days=21):
+    players = [normalize_player_input(p) for p in (players or LEGACY_PLAYERS)]
+    players = [p for p in players if p]
+    if not players:
+        players = [dict(p) for p in LEGACY_PLAYERS]
     # News and fixtures can be fetched independently so a single provider failure does not kill the app.
     with ThreadPoolExecutor(max_workers=2) as pool:
-        f_news = pool.submit(build_player_news, days, news_limit)
+        f_news = pool.submit(build_player_news, players, days, news_limit)
         f_fix = pool.submit(build_fixtures, fixture_days)
         news, news_errors = f_news.result()
         fixtures = f_fix.result()
 
     next_by_club = fixtures.get("nextByClub") or {}
     player_states = {}
-    for p in PLAYERS:
+    for p in players:
         player_states[p["name"]] = derive_player_state(p, news.get(p["name"], []), next_by_club.get(p["club"]))
 
     # Unique next fixtures for clubs in this fantasy roster, plus real articles on probable lineups.
     unique_matchups = {}
-    for club in sorted({p["club"] for p in PLAYERS}):
+    for club in sorted({p["club"] for p in players}):
         fx = next_by_club.get(club)
         if not fx:
             continue
@@ -633,9 +721,9 @@ def build_dashboard(days=7, news_limit=5, fixture_days=21):
 
     return {
         "ok": True,
-        "version": "0.6-mobile",
+        "version": "0.8-multiuser",
         "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "players": PLAYERS,
+        "players": players,
         "news": news,
         "newsErrors": news_errors,
         "fixtures": fixtures,
@@ -656,6 +744,21 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/api/config":
+            self.send_json({
+                "ok": True,
+                "version": "0.8-multiuser",
+                "cloudConfigured": bool(SUPABASE_URL and SUPABASE_ANON_KEY),
+                "supabaseUrl": SUPABASE_URL,
+                "supabaseAnonKey": SUPABASE_ANON_KEY,
+                "legacyRoster": LEGACY_PLAYERS,
+            }, 200)
+            return
+        if parsed.path == "/api/player-search":
+            q = (qs.get("q", [""])[0] or "").strip()
+            results, provider = search_players(q)
+            self.send_json({"ok": True, "results": results, "provider": provider}, 200)
+            return
         if parsed.path == "/api/dashboard":
             try:
                 days = max(1, min(14, int(qs.get("days", ["7"])[0])))
@@ -668,7 +771,7 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/news":
             try:
                 days = max(1, min(14, int(qs.get("days", ["7"])[0])))
-                news, errors = build_player_news(days, 5)
+                news, errors = build_player_news(LEGACY_PLAYERS, days, 5)
                 self.send_json({"ok": True, "players": news, "errors": errors, "provider": "Google News RSS"}, 200)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, 502)
@@ -681,14 +784,35 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, 502)
             return
         if parsed.path == "/api/health":
-            self.send_json({"ok": True, "service": "FantaCoach", "version": "0.6-mobile"}, 200)
+            self.send_json({"ok": True, "service": "FantaCoach", "version": "0.8-multiuser"}, 200)
             return
         super().do_GET()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/dashboard":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 200000:
+                    self.send_json({"ok": False, "error": "Payload troppo grande"}, 413); return
+                raw = self.rfile.read(length) if length else b"{}"
+                body = json.loads(raw.decode("utf-8") or "{}")
+                roster = body.get("players") or []
+                if not isinstance(roster, list) or len(roster) > 60:
+                    self.send_json({"ok": False, "error": "Rosa non valida"}, 400); return
+                days = max(1, min(14, int(body.get("days", 7))))
+                fixture_days = max(7, min(45, int(body.get("fixture_days", 28))))
+                payload = build_dashboard(players=roster, days=days, news_limit=5, fixture_days=fixture_days)
+                self.send_json(payload, 200)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
+        self.send_json({"ok": False, "error": "Endpoint non trovato"}, 404)
 
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
@@ -699,7 +823,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
         self.wfile.write(data)
@@ -711,7 +835,7 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     os.chdir(ROOT)
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"FantaCoach v0.5 Mobile attivo su http://127.0.0.1:{PORT}")
+    print(f"FantaCoach v0.8 Multi-utente attivo su http://127.0.0.1:{PORT}")
     print("Premi Ctrl+C per chiudere.")
     try:
         server.serve_forever()
