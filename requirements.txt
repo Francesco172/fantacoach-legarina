@@ -1,0 +1,1 @@
+# FantaCoach usa solo la libreria standard di Python.
