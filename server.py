@@ -26,8 +26,8 @@ import urllib.parse
 import urllib.request
 from xml.etree import ElementTree as ET
 
-HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", os.environ.get("FANTACOACH_PORT", "8787")))
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT") or os.environ.get("FANTACOACH_PORT") or "8787")
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
@@ -835,8 +835,8 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     os.chdir(ROOT)
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"FantaCoach v0.8 Multi-utente attivo su http://127.0.0.1:{PORT}")
-    print("Premi Ctrl+C per chiudere.")
+    print(f"FantaCoach v0.8.1 Multi-utente in ascolto su {HOST}:{PORT}", flush=True)
+    print("Health endpoint: /api/health", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

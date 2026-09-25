@@ -5,5 +5,4 @@ services:
     plan: free
     region: frankfurt
     buildCommand: echo "FantaCoach non richiede dipendenze Python esterne"
-    startCommand: python3 server.py
-    healthCheckPath: /api/health
+    startCommand: python3 -u server.py
