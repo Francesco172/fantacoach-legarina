@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""FantaCoach v0.4 - local backend for Legarina.
+"""FantaCoach v0.6 - local/backend web service for Legarina.
 
 Real inputs (when reachable from the user's connection):
 - Weekly player and probable-lineup articles: Google News RSS search.
-- Serie A fixtures: ESPN public scoreboard JSON endpoint (undocumented/community documented).
+- Serie A fixtures: provider chain (ESPN -> TheSportsDB -> official Lega Serie A embedded fallback for rounds 6-12 2026/27).
 
 Derived outputs (clearly labelled as estimates in the UI):
 - availability signal, starting-index, news impact, FantaCoach score.
@@ -33,6 +33,11 @@ CACHE_TTL_NEWS = 600
 CACHE_TTL_FIXTURES = 900
 REQUEST_TIMEOUT = 7
 MAX_WORKERS = 12
+
+SERIE_A_LEAGUE_ID = "4332"
+THESPORTSDB_KEY = os.environ.get("THESPORTSDB_KEY", "123")
+OFFICIAL_SCHEDULE_SOURCE = "https://www.legaseriea.it/serie-a/news/quando-si-gioca-anticipi-e-posticipi-fino-alla-12a-giornata"
+
 
 PLAYERS = [
     {"name": "Butez", "full": "Jean Butez", "club": "Como", "role": "POR"},
@@ -146,7 +151,7 @@ def google_news_rss(query: str, days=7, limit=5):
     q = f"{query} when:{days}d"
     params = urllib.parse.urlencode({"q": q, "hl": "it", "gl": "IT", "ceid": "IT:it"})
     url = f"https://news.google.com/rss/search?{params}"
-    req = urllib.request.Request(url, headers={"User-Agent": "FantaCoach/0.4 local-news-reader"})
+    req = urllib.request.Request(url, headers={"User-Agent": "FantaCoach/0.6 news-reader"})
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as response:
         xml_data = response.read()
 
@@ -238,7 +243,7 @@ def normalize_club(raw: str):
 
 def fetch_json(url):
     req = urllib.request.Request(url, headers={
-        "User-Agent": "FantaCoach/0.4 (+local-fantasy-football-app)",
+        "User-Agent": "FantaCoach/0.6 (+fantacoach-legarina)",
         "Accept": "application/json",
     })
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as response:
@@ -274,8 +279,154 @@ def parse_espn_events(data):
             "status": status.get("name") or status.get("description") or "Scheduled",
             "completed": bool(status.get("completed")),
             "venue": ((comp.get("venue") or {}).get("fullName") or ""),
+            "round": None,
         })
     return out
+
+
+def current_season_label(ref_date=None):
+    d = ref_date or datetime.now(timezone.utc).date()
+    start_year = d.year if d.month >= 7 else d.year - 1
+    return f"{start_year}-{start_year + 1}"
+
+
+def sportsdb_timestamp(ev):
+    raw = ev.get("strTimestamp") or ""
+    if raw:
+        dt = parse_date(raw)
+        if dt:
+            return dt.isoformat()
+    date_part = ev.get("dateEvent") or ""
+    time_part = ev.get("strTime") or ev.get("strTimeLocal") or "12:00:00"
+    if date_part:
+        try:
+            # TheSportsDB soccer times are generally UTC in strTime.
+            dt = datetime.fromisoformat(f"{date_part}T{time_part[:8]}+00:00")
+            return dt.astimezone(timezone.utc).isoformat()
+        except Exception:
+            pass
+    return None
+
+
+def parse_sportsdb_events(data):
+    out = []
+    for ev in (data or {}).get("events", []) or []:
+        home_raw = ev.get("strHomeTeam") or ""
+        away_raw = ev.get("strAwayTeam") or ""
+        if not home_raw or not away_raw:
+            continue
+        status_text = (ev.get("strStatus") or ev.get("strProgress") or "Scheduled").strip()
+        completed = status_text.lower() in {"match finished", "finished", "ft", "aet", "pen"}
+        out.append({
+            "id": str(ev.get("idEvent") or ""),
+            "date": sportsdb_timestamp(ev),
+            "home": normalize_club(home_raw),
+            "away": normalize_club(away_raw),
+            "homeProviderName": home_raw,
+            "awayProviderName": away_raw,
+            "status": status_text or "Scheduled",
+            "completed": completed,
+            "venue": ev.get("strVenue") or "",
+            "round": ev.get("intRound"),
+        })
+    return out
+
+
+def fetch_sportsdb_next_round():
+    base = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_KEY}"
+    first = fetch_json(f"{base}/eventsnextleague.php?id={SERIE_A_LEAGUE_ID}")
+    next_events = (first or {}).get("events") or []
+    if not next_events:
+        return []
+    seed = next_events[0]
+    round_no = seed.get("intRound")
+    season = seed.get("strSeason") or current_season_label()
+    if round_no:
+        try:
+            round_data = fetch_json(
+                f"{base}/eventsround.php?id={SERIE_A_LEAGUE_ID}&r={urllib.parse.quote(str(round_no))}&s={urllib.parse.quote(season)}"
+            )
+            parsed = parse_sportsdb_events(round_data)
+            if parsed:
+                return parsed
+        except Exception:
+            pass
+    return parse_sportsdb_events(first)
+
+
+def official_embedded_schedule():
+    """Published Serie A 2026/27 kickoffs for rounds 6-12.
+
+    Emergency fallback only. It is intentionally date-bounded so it cannot silently
+    masquerade as live data after the published range has passed.
+    """
+    rows = [
+        # round 6
+        (6,"2026-10-10T13:00:00+00:00","Genoa","Fiorentina"),(6,"2026-10-10T16:00:00+00:00","Inter","Parma"),(6,"2026-10-10T18:45:00+00:00","Napoli","Frosinone"),
+        (6,"2026-10-11T10:30:00+00:00","Como","Roma"),(6,"2026-10-11T13:00:00+00:00","Lazio","Monza"),(6,"2026-10-11T13:00:00+00:00","Lecce","Bologna"),(6,"2026-10-11T16:00:00+00:00","Sassuolo","Milan"),(6,"2026-10-11T18:45:00+00:00","Cagliari","Juventus"),
+        (6,"2026-10-12T16:30:00+00:00","Atalanta","Venezia"),(6,"2026-10-12T18:45:00+00:00","Torino","Udinese"),
+        # round 7
+        (7,"2026-10-16T18:45:00+00:00","Frosinone","Sassuolo"),(7,"2026-10-17T13:00:00+00:00","Venezia","Napoli"),(7,"2026-10-17T16:00:00+00:00","Bologna","Inter"),(7,"2026-10-17T18:45:00+00:00","Roma","Genoa"),
+        (7,"2026-10-18T10:30:00+00:00","Udinese","Lecce"),(7,"2026-10-18T13:00:00+00:00","Fiorentina","Como"),(7,"2026-10-18T16:00:00+00:00","Milan","Atalanta"),(7,"2026-10-18T18:45:00+00:00","Juventus","Lazio"),(7,"2026-10-19T16:30:00+00:00","Monza","Cagliari"),(7,"2026-10-19T18:45:00+00:00","Parma","Torino"),
+        # round 8
+        (8,"2026-10-23T18:45:00+00:00","Torino","Monza"),(8,"2026-10-24T13:00:00+00:00","Como","Sassuolo"),(8,"2026-10-24T13:00:00+00:00","Cagliari","Bologna"),(8,"2026-10-24T16:00:00+00:00","Napoli","Roma"),(8,"2026-10-24T18:45:00+00:00","Lazio","Parma"),
+        (8,"2026-10-25T10:30:00+00:00","Inter","Fiorentina"),(8,"2026-10-25T13:00:00+00:00","Atalanta","Frosinone"),(8,"2026-10-25T13:00:00+00:00","Genoa","Venezia"),(8,"2026-10-25T16:00:00+00:00","Lecce","Juventus"),(8,"2026-10-25T18:45:00+00:00","Udinese","Milan"),
+        # round 9
+        (9,"2026-10-27T17:30:00+00:00","Sassuolo","Lazio"),(9,"2026-10-27T19:45:00+00:00","Roma","Cagliari"),(9,"2026-10-27T19:45:00+00:00","Torino","Como"),
+        (9,"2026-10-28T17:30:00+00:00","Milan","Bologna"),(9,"2026-10-28T17:30:00+00:00","Parma","Udinese"),(9,"2026-10-28T17:30:00+00:00","Venezia","Inter"),(9,"2026-10-28T19:45:00+00:00","Genoa","Juventus"),(9,"2026-10-28T19:45:00+00:00","Monza","Napoli"),(9,"2026-10-29T17:30:00+00:00","Frosinone","Lecce"),(9,"2026-10-29T19:45:00+00:00","Fiorentina","Atalanta"),
+        # round 10
+        (10,"2026-10-31T14:00:00+00:00","Bologna","Monza"),(10,"2026-10-31T17:00:00+00:00","Udinese","Roma"),(10,"2026-10-31T19:45:00+00:00","Milan","Inter"),
+        (10,"2026-11-01T11:30:00+00:00","Como","Venezia"),(10,"2026-11-01T14:00:00+00:00","Frosinone","Torino"),(10,"2026-11-01T14:00:00+00:00","Lazio","Cagliari"),(10,"2026-11-01T17:00:00+00:00","Lecce","Genoa"),(10,"2026-11-01T19:45:00+00:00","Juventus","Napoli"),(10,"2026-11-02T17:30:00+00:00","Sassuolo","Fiorentina"),(10,"2026-11-02T19:45:00+00:00","Atalanta","Parma"),
+        # round 11
+        (11,"2026-11-06T19:45:00+00:00","Venezia","Udinese"),(11,"2026-11-07T14:00:00+00:00","Cagliari","Frosinone"),(11,"2026-11-07T14:00:00+00:00","Torino","Lecce"),(11,"2026-11-07T17:00:00+00:00","Parma","Bologna"),(11,"2026-11-07T19:45:00+00:00","Roma","Sassuolo"),
+        (11,"2026-11-08T11:30:00+00:00","Napoli","Lazio"),(11,"2026-11-08T14:00:00+00:00","Genoa","Milan"),(11,"2026-11-08T14:00:00+00:00","Monza","Atalanta"),(11,"2026-11-08T17:00:00+00:00","Inter","Como"),(11,"2026-11-08T19:45:00+00:00","Fiorentina","Juventus"),
+        # round 12
+        (12,"2026-11-21T14:00:00+00:00","Como","Cagliari"),(12,"2026-11-21T14:00:00+00:00","Lazio","Lecce"),(12,"2026-11-21T17:00:00+00:00","Parma","Roma"),(12,"2026-11-21T19:45:00+00:00","Napoli","Torino"),
+        (12,"2026-11-22T11:30:00+00:00","Sassuolo","Genoa"),(12,"2026-11-22T14:00:00+00:00","Milan","Frosinone"),(12,"2026-11-22T17:00:00+00:00","Bologna","Udinese"),(12,"2026-11-22T19:45:00+00:00","Atalanta","Inter"),(12,"2026-11-23T17:30:00+00:00","Monza","Fiorentina"),(12,"2026-11-23T19:45:00+00:00","Juventus","Venezia"),
+    ]
+    return [{
+        "id": f"lega-{rnd}-{i}", "date": dt, "home": home, "away": away,
+        "homeProviderName": home, "awayProviderName": away, "status": "Scheduled",
+        "completed": False, "venue": "Serie A", "round": rnd,
+    } for i,(rnd,dt,home,away) in enumerate(rows, 1)]
+
+
+def _future_events(events, window_days):
+    utc_now = datetime.now(timezone.utc)
+    cutoff = utc_now + timedelta(days=window_days)
+    upcoming = []
+    for ev in events:
+        dt = parse_date(ev.get("date"))
+        if not dt:
+            continue
+        if dt >= utc_now - timedelta(hours=4) and dt <= cutoff and not ev.get("completed"):
+            item = dict(ev)
+            item["date"] = dt.isoformat()
+            upcoming.append(item)
+    upcoming.sort(key=lambda e: e["date"])
+    return upcoming
+
+
+def _fixture_payload(events, provider, provider_note, error=None, source_url=None):
+    next_by_club = {}
+    for ev in events:
+        for club in (ev["home"], ev["away"]):
+            if club and club not in next_by_club:
+                opponent = ev["away"] if club == ev["home"] else ev["home"]
+                next_by_club[club] = {
+                    "eventId": ev["id"], "date": ev["date"], "home": ev["home"], "away": ev["away"],
+                    "opponent": opponent, "isHome": club == ev["home"], "venue": ev.get("venue", ""),
+                    "round": ev.get("round"),
+                }
+    return {
+        "events": events,
+        "nextByClub": next_by_club,
+        "provider": provider,
+        "providerNote": provider_note,
+        "sourceUrl": source_url,
+        "error": error,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def build_fixtures(window_days=21):
@@ -286,59 +437,62 @@ def build_fixtures(window_days=21):
     today = datetime.now(timezone.utc).date()
     end = today + timedelta(days=window_days)
     date_range = f"{today.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
-    urls = [
+    provider_errors = []
+
+    # Provider 1: ESPN JSON (fast when available).
+    espn_urls = [
         f"https://site.api.espn.com/apis/site/v2/sports/soccer/ita.1/scoreboard?dates={date_range}&limit=100",
         f"https://site.web.api.espn.com/apis/site/v2/sports/soccer/ita.1/scoreboard?dates={date_range}&limit=100",
     ]
-    last_error = None
-    events = []
-    for url in urls:
+    for url in espn_urls:
         try:
-            events = parse_espn_events(fetch_json(url))
-            if events:
-                last_error = None
-                break
+            upcoming = _future_events(parse_espn_events(fetch_json(url)), window_days)
+            if upcoming:
+                payload = _fixture_payload(upcoming, "ESPN scoreboard JSON", "Calendario live da endpoint pubblico ESPN.")
+                payload["providerErrors"] = provider_errors
+                FIXTURE_CACHE.update({"timestamp": now, "payload": payload})
+                return dict(payload)
         except Exception as exc:
-            last_error = str(exc)
+            provider_errors.append(f"ESPN: {exc}")
 
-    # Only future/not-completed events, sorted by date.
-    upcoming = []
-    utc_now = datetime.now(timezone.utc)
-    for ev in events:
-        dt = parse_date(ev.get("date"))
-        if not dt:
-            continue
-        if dt >= utc_now - timedelta(hours=4) and not ev.get("completed"):
-            ev["date"] = dt.isoformat()
-            upcoming.append(ev)
-    upcoming.sort(key=lambda e: e["date"])
+    # Provider 2: TheSportsDB. The next event tells us the round; eventsround then returns that matchday.
+    try:
+        upcoming = _future_events(fetch_sportsdb_next_round(), window_days)
+        if upcoming:
+            payload = _fixture_payload(
+                upcoming,
+                "TheSportsDB",
+                "Fallback API gratuito: prossima giornata di Serie A.",
+                source_url="https://www.thesportsdb.com/league/4332",
+            )
+            payload["providerErrors"] = provider_errors
+            FIXTURE_CACHE.update({"timestamp": now, "payload": payload})
+            return dict(payload)
+    except Exception as exc:
+        provider_errors.append(f"TheSportsDB: {exc}")
 
-    next_by_club = {}
-    for ev in upcoming:
-        for club in (ev["home"], ev["away"]):
-            if club and club not in next_by_club:
-                opponent = ev["away"] if club == ev["home"] else ev["home"]
-                next_by_club[club] = {
-                    "eventId": ev["id"],
-                    "date": ev["date"],
-                    "home": ev["home"],
-                    "away": ev["away"],
-                    "opponent": opponent,
-                    "isHome": club == ev["home"],
-                    "venue": ev.get("venue", ""),
-                }
+    # Provider 3: official published Lega Serie A dates for rounds 6-12 only.
+    embedded = _future_events(official_embedded_schedule(), window_days)
+    if embedded:
+        payload = _fixture_payload(
+            embedded,
+            "Lega Serie A (fallback ufficiale incorporato)",
+            "Date/orari pubblicati ufficialmente per le giornate 6-12. Fallback locale, non feed live.",
+            error="; ".join(provider_errors) if provider_errors else None,
+            source_url=OFFICIAL_SCHEDULE_SOURCE,
+        )
+        payload["providerErrors"] = provider_errors
+        FIXTURE_CACHE.update({"timestamp": now, "payload": payload})
+        return dict(payload)
 
-    payload = {
-        "events": upcoming,
-        "nextByClub": next_by_club,
-        "provider": "ESPN scoreboard JSON",
-        "providerNote": "Endpoint pubblico non ufficialmente documentato; se non risponde, FantaCoach mantiene disponibili le news.",
-        "error": last_error,
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-    }
+    payload = _fixture_payload(
+        [], "non disponibile",
+        "Nessun provider calendario ha restituito partite nel periodo richiesto.",
+        error="; ".join(provider_errors) if provider_errors else "Nessuna partita trovata.",
+    )
+    payload["providerErrors"] = provider_errors
     FIXTURE_CACHE.update({"timestamp": now, "payload": payload})
     return dict(payload)
-
 
 def most_recent_signal(articles):
     signals = []
@@ -479,7 +633,7 @@ def build_dashboard(days=7, news_limit=5, fixture_days=21):
 
     return {
         "ok": True,
-        "version": "0.5-mobile",
+        "version": "0.6-mobile",
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "players": PLAYERS,
         "news": news,
@@ -527,7 +681,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, 502)
             return
         if parsed.path == "/api/health":
-            self.send_json({"ok": True, "service": "FantaCoach", "version": "0.5-mobile"}, 200)
+            self.send_json({"ok": True, "service": "FantaCoach", "version": "0.6-mobile"}, 200)
             return
         super().do_GET()
 
